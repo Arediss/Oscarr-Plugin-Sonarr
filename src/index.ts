@@ -53,7 +53,7 @@ export function register(ctx: PluginContext) {
       seasonsRoutes(app);
       qualityRoutes(app);
       releasesRoutes(app);
-      analyticsRoutes(app);
+      analyticsRoutes(app, ctx);
       filesRoutes(app);
       downloadsRoutes(app);
 

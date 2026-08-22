@@ -1,7 +1,14 @@
 import type { FastifyInstance } from 'fastify';
+import { applyQuotas, parseQuotas, serialiseQuotas } from '../quotas.js';
+
+/** Only the slice of the plugin context these routes need. */
+interface QuotaContext {
+  getSetting(key: string): Promise<unknown>;
+  setSetting(key: string, value: unknown): Promise<void>;
+}
 import type { SonarrPluginApi } from '../sonarr-api.js';
 
-export function analyticsRoutes(app: FastifyInstance) {
+export function analyticsRoutes(app: FastifyInstance, ctx: QuotaContext) {
   app.get('/analytics', async (request) => {
     const api: SonarrPluginApi = (request as any).sonarrApi;
 
@@ -92,14 +99,7 @@ export function analyticsRoutes(app: FastifyInstance) {
       seriesTypeCounts: Object.entries(seriesTypeCounts)
         .map(([name, count]) => ({ name, count }))
         .filter((x) => x.count > 0),
-      diskSpace: diskSpace.map((d) => ({
-        path: d.path,
-        label: d.label,
-        freeSpace: d.freeSpace,
-        totalSpace: d.totalSpace,
-        usedSpace: d.totalSpace - d.freeSpace,
-        usedPercent: d.totalSpace > 0 ? Math.round(((d.totalSpace - d.freeSpace) / d.totalSpace) * 100) : 0,
-      })),
+      diskSpace: applyQuotas(diskSpace, parseQuotas(await ctx.getSetting('rootFolderQuotas') as string | null)),
       timeline: Object.entries(timeline).map(([month, count]) => ({ month, count })),
       rootFolders: Object.entries(rootFolders)
         .map(([path, data]) => ({ path, ...data }))
@@ -121,4 +121,21 @@ export function analyticsRoutes(app: FastifyInstance) {
     const { page = '1', pageSize = '50', eventType } = request.query as Record<string, string>;
     return api.getHistory(parseInt(page), parseInt(pageSize), eventType);
   });
+
+  /** Declared caps, keyed by root folder path. `/quotas` rather than `/settings`, which the core
+   *  reserves for its own plugin-settings endpoint. */
+  app.get('/quotas', async () => ({
+    quotas: parseQuotas(await ctx.getSetting('rootFolderQuotas') as string | null),
+  }));
+
+  app.put('/quotas', async (request, reply) => {
+    const body = (request.body ?? {}) as { quotas?: unknown };
+    if (!body.quotas || typeof body.quotas !== 'object' || Array.isArray(body.quotas)) {
+      return reply.status(400).send({ error: 'quotas must be an object keyed by root folder path' });
+    }
+    const stored = serialiseQuotas(body.quotas as Record<string, number>);
+    await ctx.setSetting('rootFolderQuotas', stored);
+    return { quotas: parseQuotas(stored) };
+  });
+
 }

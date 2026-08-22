@@ -20,6 +20,9 @@ interface AnalyticsData {
     totalSpace: number;
     usedSpace: number;
     usedPercent: number;
+    quotaBytes: number | null;
+    effectiveFree: number;
+    quotaLimited: boolean;
   }[];
   timeline: { month: string; count: number }[];
   rootFolders: { path: string; count: number; size: number }[];
@@ -66,6 +69,8 @@ export function AnalyticsTab() {
   const [data, setData] = useState<AnalyticsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Bumped after saving a cap, so the bars re-read the figures that just changed.
+  const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -121,7 +126,10 @@ export function AnalyticsTab() {
       {/* Disk Space */}
       {data.diskSpace.length > 0 && (
         <div className="space-y-3">
-          <h3 className="text-sm font-semibold text-ndp-text">Disk Space</h3>
+          <div className="flex items-center gap-3">
+            <h3 className="text-sm font-semibold text-ndp-text">Disk Space</h3>
+            <QuotaEditor disks={data.diskSpace} onSaved={() => setReloadToken((n) => n + 1)} />
+          </div>
           <div className="card p-5 space-y-4">
             {data.diskSpace.map((disk) => (
               <div key={disk.path}>
@@ -133,6 +141,12 @@ export function AnalyticsTab() {
                     {formatSize(disk.usedSpace)} / {formatSize(disk.totalSpace)} ({disk.usedPercent}%)
                   </span>
                 </div>
+                {disk.quotaLimited && (
+                  <p className="mb-1.5 text-xs text-yellow-500">
+                    Quota caps this folder at {formatSize(disk.quotaBytes ?? 0)} — {formatSize(disk.effectiveFree)} writable,
+                    not the {formatSize(disk.freeSpace)} the filesystem reports.
+                  </p>
+                )}
                 <div className="w-full h-3 bg-white/5 rounded-full overflow-hidden">
                   <div
                     className={
@@ -254,6 +268,99 @@ export function AnalyticsTab() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+const GIB = 1024 ** 3;
+const BASE = '/api/plugins/sonarr';
+
+/** Declared storage caps, per root folder.
+ *
+ *  Radarr and Sonarr report what the filesystem says. A *user* quota sits above that and is
+ *  invisible to them, so an operator with 3 TB free on paper can still hit a wall. Reading the
+ *  real quota would mean running `quota` as the owning user on the host that holds the media —
+ *  Oscarr is in its own container, without the library mounted. So the admin declares it. */
+function QuotaEditor({ disks, onSaved }: Readonly<{
+  disks: { path: string; label: string; quotaBytes: number | null }[];
+  onSaved: () => void;
+}>) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const start = () => {
+    const initial: Record<string, string> = {};
+    for (const d of disks) initial[d.path] = d.quotaBytes ? String(Math.round(d.quotaBytes / GIB)) : '';
+    setDraft(initial);
+    setError(null);
+    setOpen(true);
+  };
+
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const quotas: Record<string, number> = {};
+      for (const [path, value] of Object.entries(draft)) {
+        const gib = Number(value);
+        // Blank or zero means "no cap" — the backend drops anything not strictly positive.
+        if (Number.isFinite(gib) && gib > 0) quotas[path] = Math.round(gib * GIB);
+      }
+      const res = await fetch(`${BASE}/quotas`, {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quotas }),
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+      setOpen(false);
+      onSaved();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <button onClick={start} className="text-xs text-ndp-accent hover:text-ndp-accent/80 transition-colors">
+        Set storage caps
+      </button>
+    );
+  }
+
+  return (
+    <div className="mt-3 space-y-3 border-t border-white/10 pt-3">
+      <p className="text-xs text-ndp-text-dim">
+        Leave blank when a folder has no quota. Values are in GiB; the bar then shows whichever
+        limit binds first.
+      </p>
+      {disks.map((d) => (
+        <div key={d.path} className="flex items-center gap-3">
+          <span className="flex-1 truncate text-xs text-ndp-text" title={d.path}>{d.label || d.path}</span>
+          <input
+            type="number"
+            min={0}
+            value={draft[d.path] ?? ''}
+            onChange={(e) => setDraft((prev) => ({ ...prev, [d.path]: e.target.value }))}
+            placeholder="no cap"
+            className="input w-32 text-sm"
+          />
+          <span className="text-xs text-ndp-text-dim">GiB</span>
+        </div>
+      ))}
+      {error && <p className="text-xs text-ndp-error">{error}</p>}
+      <div className="flex gap-2">
+        <button onClick={save} disabled={saving} className="btn-primary text-xs px-3 py-1.5">
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <button onClick={() => setOpen(false)} className="text-xs text-ndp-text-dim hover:text-ndp-text px-2">
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

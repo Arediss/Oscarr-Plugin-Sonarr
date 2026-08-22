@@ -12,6 +12,7 @@ const PREFIX = '/api/plugins/sonarr';
 /** Read-only surface. */
 const VIEW_ROUTES = [
   'GET:/analytics',
+  'GET:/quotas',
   'GET:/analytics/history',
   'GET:/blocklist',
   'GET:/command/:id',
@@ -34,6 +35,7 @@ const VIEW_ROUTES = [
 
 /** Mutates the service or files on disk. */
 const MANAGE_ROUTES = [
+  'PUT:/quotas',
   'DELETE:/blocklist/:id',
   'DELETE:/episodefile/:fileId',
   'DELETE:/queue/:id',
