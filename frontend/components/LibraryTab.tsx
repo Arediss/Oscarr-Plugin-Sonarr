@@ -45,6 +45,20 @@ function getStatusInfo(series: SeriesSummary): { label: string; className: strin
 
 const PAGE_SIZE = 50;
 
+/** Opens straight onto one title when Oscarr deep-links here from a media page
+ *  (/admin?tab=plugin:sonarr&seriesId=123). The parameter is consumed once and stripped, so a
+ *  later tab switch or refresh does not reopen the modal the admin just closed. */
+function consumeSeriesParam(): number | null {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get('seriesId');
+  if (!raw) return null;
+  const id = Number.parseInt(raw, 10);
+  params.delete('seriesId');
+  const search = params.toString();
+  window.history.replaceState({}, '', `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
 export function LibraryTab() {
   const [series, setSeries] = useState<SeriesSummary[]>([]);
   const [profiles, setProfiles] = useState<QualityProfile[]>([]);
@@ -59,7 +73,7 @@ export function LibraryTab() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [profileFilter, setProfileFilter] = useState('all');
   const [typeFilter, setTypeFilter] = useState('all');
-  const [selectedSeriesId, setSelectedSeriesId] = useState<number | null>(null);
+  const [selectedSeriesId, setSelectedSeriesId] = useState<number | null>(consumeSeriesParam);
   const [viewMode, setViewMode] = useState<'table' | 'cards'>(() => {
     try { return (localStorage.getItem('plugin-sonarr-library-view') as 'table' | 'cards') || 'table'; }
     catch { return 'table'; }

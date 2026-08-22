@@ -10,12 +10,15 @@ import { releasesRoutes } from './routes/releases.js';
 import { analyticsRoutes } from './routes/analytics.js';
 import { filesRoutes } from './routes/files.js';
 import { downloadsRoutes } from './routes/downloads.js';
+import { registerPermissions } from './permissions.js';
 
 interface PluginContext {
   log: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void };
   getServiceConfig(serviceType: string): Promise<{ url: string; apiKey: string } | null>;
   getSetting(key: string): Promise<unknown>;
   setSetting(key: string, value: unknown): Promise<void>;
+  registerPluginPermission(permission: string, description?: string): void;
+  registerRoutePermission(routeKey: string, rule: { permission: string; ownerScoped?: boolean }): void;
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -32,6 +35,8 @@ async function getApi(ctx: PluginContext): Promise<SonarrPluginApi> {
 }
 
 export function register(ctx: PluginContext) {
+  registerPermissions(ctx);
+
   return {
     manifest,
 
