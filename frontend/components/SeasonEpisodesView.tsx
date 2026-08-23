@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { EpisodeReleasesModal } from './EpisodeReleasesModal';
 
 interface Episode {
   id: number;
@@ -47,6 +48,8 @@ export function SeasonEpisodesView({ seriesId, seasonNumber, onBack, showMessage
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState<'none' | 'search' | 'monitor' | 'unmonitor'>('none');
+  // Which episode's release list is open, if any.
+  const [releasesFor, setReleasesFor] = useState<{ id: number; label: string } | null>(null);
 
   const loadEpisodes = useCallback(async () => {
     setLoading(true);
@@ -148,6 +151,7 @@ export function SeasonEpisodesView({ seriesId, seasonNumber, onBack, showMessage
   const allSelected = selected.size === episodes.length && episodes.length > 0;
 
   return (
+    <>
     <div className="space-y-3">
       {/* Header bar */}
       <div className="flex items-center justify-between">
@@ -259,7 +263,14 @@ export function SeasonEpisodesView({ seriesId, seasonNumber, onBack, showMessage
                         onClick={() => searchSingle(ep.id)}
                         className="text-xs px-2.5 py-1 rounded-lg bg-ndp-accent/20 text-ndp-accent hover:bg-ndp-accent/30 transition-colors"
                       >
-                        Search
+                        Auto
+                      </button>
+                      <button
+                        onClick={() => setReleasesFor({ id: ep.id, label: `S${String(seasonNumber).padStart(2, '0')}E${String(ep.episodeNumber).padStart(2, '0')}` })}
+                        title="List releases from your indexers. Nothing is downloaded until you pick one."
+                        className="text-xs px-2.5 py-1 rounded-lg bg-white/5 text-ndp-text hover:bg-white/10 transition-colors ml-1.5"
+                      >
+                        Releases
                       </button>
                     </td>
                   </tr>
@@ -277,5 +288,15 @@ export function SeasonEpisodesView({ seriesId, seasonNumber, onBack, showMessage
         </div>
       </div>
     </div>
+
+      {releasesFor && (
+        <EpisodeReleasesModal
+          episodeId={releasesFor.id}
+          label={releasesFor.label}
+          onClose={() => setReleasesFor(null)}
+          showMessage={showMessage}
+        />
+      )}
+    </>
   );
 }
