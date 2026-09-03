@@ -231,8 +231,19 @@ export class SonarrPluginApi {
     return data;
   }
 
-  async deleteSeries(id: number, deleteFiles = false): Promise<void> {
-    await this.api.delete(`/series/${id}`, { params: { deleteFiles } });
+  /** Removes the series from Sonarr's library. `deleteFiles` also unlinks what is on disk;
+   *  `addImportExclusion` stops a list from silently re-adding it on the next sync — the usual
+   *  reason a removed title reappears a day later. */
+  async deleteSeries(
+    id: number,
+    opts: { deleteFiles?: boolean; addImportExclusion?: boolean } = {},
+  ): Promise<void> {
+    await this.api.delete(`/series/${id}`, {
+      params: {
+        deleteFiles: opts.deleteFiles === true,
+        addImportExclusion: opts.addImportExclusion === true,
+      },
+    });
   }
 
   // ── Seasons / Episodes ───────────────────────────────────────────
@@ -377,9 +388,19 @@ export class SonarrPluginApi {
     await this.api.post('/command', { name: 'RenameSeries', seriesIds: [seriesId] });
   }
 
-  async getCommandStatus(commandId: number): Promise<{ status: string; started?: string; ended?: string }> {
+  /** `message` and `result` are Sonarr's own words for how the command ended — worth relaying
+   *  rather than telling the user to go and look for themselves. */
+  async getCommandStatus(commandId: number): Promise<{
+    status: string; result?: string; message?: string; started?: string; ended?: string;
+  }> {
     const { data } = await this.api.get(`/command/${commandId}`);
-    return { status: data.status, started: data.started, ended: data.ended };
+    return {
+      status: data.status,
+      result: data.result,
+      message: data.message,
+      started: data.started,
+      ended: data.ended,
+    };
   }
 
   // ── Queue ────────────────────────────────────────────────────────

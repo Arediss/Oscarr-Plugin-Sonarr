@@ -31,6 +31,18 @@ interface SeriesDetail {
     sizeOnDisk: number;
     percentOfEpisodes: number;
   };
+  // Sonarr sends all of these on /series/{id}; optional here so a field the instance does not
+  // populate simply does not render, rather than printing "undefined".
+  rootFolderPath?: string;
+  added?: string;
+  certification?: string;
+  originalLanguage?: { id: number; name: string };
+  airTime?: string;
+  firstAired?: string;
+  nextAiring?: string;
+  previousAiring?: string;
+  ended?: boolean;
+  ratings?: { value?: number; votes?: number };
 }
 
 interface SeasonSummary {
@@ -106,6 +118,9 @@ interface BlocklistItem {
 interface SeriesModalProps {
   seriesId: number;
   onClose: () => void;
+  /** Fired after the series is removed from Sonarr, so the library can drop it from the list
+   *  instead of showing a title that no longer exists. */
+  onRemoved?: () => void;
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -146,6 +161,12 @@ function epTag(ep?: { seasonNumber: number; episodeNumber: number }): string {
 
 type ActionState = 'idle' | 'loading' | 'success' | 'error';
 type SearchPhase = 'idle' | 'searching' | 'polling' | 'done' | 'error';
+
+/** What the last automatic search actually achieved, so the queue can say so instead of
+ *  showing a bare "nothing here" to someone who just asked Sonarr to find something. */
+type SearchOutcome =
+  | { kind: 'grabbed'; titles: string[] }
+  | { kind: 'nothing'; reason?: string };
 type TabId = 'overview' | 'seasons' | 'files' | 'history' | 'queue' | 'blocklist';
 
 interface InlineMessage {
@@ -171,8 +192,9 @@ function eventMeta(eventType: string) {
 // Component
 // ──────────────────────────────────────────────────────────────────
 
-export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
+export function SeriesModal({ seriesId, onClose, onRemoved }: SeriesModalProps) {
   const [series, setSeries] = useState<SeriesDetail | null>(null);
+  const [profileName, setProfileName] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -184,10 +206,13 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
   }, []);
 
   const [searchPhase, setSearchPhase] = useState<SearchPhase>('idle');
+  const [searchOutcome, setSearchOutcome] = useState<SearchOutcome | null>(null);
   const [refreshState, setRefreshState] = useState<ActionState>('idle');
   const [monitorState, setMonitorState] = useState<ActionState>('idle');
-  const [deleteConfirm, setDeleteConfirm] = useState<'none' | 'confirm' | 'confirm-files'>('none');
   const [deleteState, setDeleteState] = useState<ActionState>('idle');
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removeFiles, setRemoveFiles] = useState(false);
+  const [removeExclusion, setRemoveExclusion] = useState(false);
   const [message, setMessage] = useState<InlineMessage | null>(null);
 
   // Seasons drill-down state
@@ -238,6 +263,7 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
       .then(([detail, seasonsData]) => {
         if (cancelled) return;
         setSeries(detail?.series || null);
+        setProfileName(detail?.qualityProfileName ?? null);
         setSeasons(Array.isArray(seasonsData?.seasons) ? seasonsData.seasons : []);
       })
       .catch((err) => { if (!cancelled) setError(err.message || 'Failed to load series'); })
@@ -327,8 +353,52 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
   }, [activeTab, loadFiles, loadHistory, loadBlocklist]);
 
   // Whole-series actions.
+
+  /** Sonarr hands each release to the download client, which then registers it in the queue — the
+   *  two are not simultaneous. Give it a few seconds before concluding nothing was grabbed. */
+  const settledQueue = useCallback(async (before: Set<number>): Promise<QueueItem[]> => {
+    let latest: QueueItem[] = [];
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const r = await fetch(`/api/plugins/sonarr/series/${seriesId}/queue`, { credentials: 'include' });
+        const data = r.ok ? await r.json() : null;
+        latest = Array.isArray(data?.items) ? data.items : [];
+      } catch {
+        latest = [];
+      }
+      if (latest.some((item) => !before.has(item.id))) break;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    setQueue(latest);
+    return latest;
+  }, [seriesId]);
+
+  const reportSearchResult = useCallback(async (before: Set<number>, sonarrMessage?: string) => {
+    const after = await settledQueue(before);
+    const fresh = after.filter((item) => !before.has(item.id));
+
+    if (fresh.length > 0) {
+      setSearchOutcome({ kind: 'grabbed', titles: fresh.map((item) => item.title) });
+      showMessage(
+        fresh.length === 1
+          ? 'Grabbed 1 episode — downloading now'
+          : `Grabbed ${fresh.length} episodes — downloading now`,
+        'success',
+      );
+      return;
+    }
+
+    // Sonarr completed without grabbing: every candidate failed its quality or custom-format
+    // checks, or the episodes on disk already meet the cutoff. Its own message says which.
+    setSearchOutcome({ kind: 'nothing', reason: sonarrMessage });
+    showMessage(sonarrMessage || 'Sonarr found nothing worth grabbing', 'error');
+  }, [settledQueue]);
+
   const handleSearch = async () => {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    const before = new Set((queue ?? []).map((item) => item.id));
+    setActiveTab('queue');
+    setSearchOutcome(null);
     setSearchPhase('searching');
     try {
       const r = await fetch(`/api/plugins/sonarr/series/${seriesId}/search`, { method: 'POST', credentials: 'include' });
@@ -337,7 +407,7 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
       const commandId = data.commandId;
       if (!commandId) {
         setSearchPhase('done');
-        showMessage('Series search sent', 'success');
+        await reportSearchResult(before);
         return;
       }
       setSearchPhase('polling');
@@ -349,11 +419,12 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
           if (statusData.status === 'completed') {
             if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
             setSearchPhase('done');
-            showMessage('Series search complete', 'success');
+            await reportSearchResult(before, statusData.message);
           } else if (statusData.status === 'failed') {
             if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
             setSearchPhase('error');
-            showMessage('Search command failed', 'error');
+            setSearchOutcome({ kind: 'nothing', reason: statusData.message });
+            showMessage(statusData.message || 'Sonarr could not complete the search', 'error');
           }
         } catch {
           if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
@@ -402,22 +473,29 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
     setTimeout(() => setMonitorState('idle'), 2000);
   };
 
-  const handleDeleteSeries = async (deleteFiles: boolean) => {
+  /** Removing the library entry is not the same act as deleting its files, and conflating the
+   *  two is how people lose media they meant to keep. Both flags are opt-in and stated plainly. */
+  const handleRemoveSeries = async () => {
     setDeleteState('loading');
     try {
-      const r = await fetch(`/api/plugins/sonarr/series/${seriesId}?deleteFiles=${deleteFiles}`, {
+      const params = new URLSearchParams({
+        deleteFiles: String(removeFiles),
+        addImportExclusion: String(removeExclusion),
+      });
+      const r = await fetch(`/api/plugins/sonarr/series/${seriesId}?${params}`, {
         method: 'DELETE',
         credentials: 'include',
       });
       if (!r.ok) throw new Error();
       setDeleteState('success');
-      showMessage(deleteFiles ? 'Series and files deleted' : 'Series removed from Sonarr', 'success');
-      setTimeout(() => onClose(), 800);
+      setRemoveOpen(false);
+      onRemoved?.();
+      onClose();
     } catch {
       setDeleteState('error');
-      showMessage('Delete failed', 'error');
+      showMessage('Could not remove this series from Sonarr', 'error');
+      setTimeout(() => setDeleteState('idle'), 2000);
     }
-    setTimeout(() => setDeleteState('idle'), 2000);
   };
 
   // Season actions (outside drill-down)
@@ -716,37 +794,13 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
                   {monitorState === 'loading' ? '…' : (series.monitored ? 'Unmonitor' : 'Monitor')}
                 </button>
 
-                {deleteConfirm === 'none' ? (
-                  <button
-                    onClick={() => setDeleteConfirm('confirm')}
-                    className="text-xs font-medium rounded-lg bg-ndp-error/10 hover:bg-ndp-error/20 text-ndp-error transition-colors px-3 py-1.5 whitespace-nowrap"
-                  >
-                    Delete
-                  </button>
-                ) : (
-                  <>
-                    <button
-                      onClick={() => handleDeleteSeries(false)}
-                      disabled={deleteState === 'loading'}
-                      className="text-xs font-medium rounded-lg bg-white/10 hover:bg-white/15 text-ndp-text transition-colors disabled:opacity-50 px-3 py-1.5 whitespace-nowrap"
-                    >
-                      Remove only
-                    </button>
-                    <button
-                      onClick={() => handleDeleteSeries(true)}
-                      disabled={deleteState === 'loading'}
-                      className="text-xs font-medium rounded-lg bg-ndp-error text-white hover:bg-ndp-error/80 transition-colors disabled:opacity-50 px-3 py-1.5 whitespace-nowrap"
-                    >
-                      {deleteState === 'loading' ? '…' : 'Remove + files'}
-                    </button>
-                    <button
-                      onClick={() => setDeleteConfirm('none')}
-                      className="text-xs font-medium rounded-lg bg-white/10 text-ndp-text-dim hover:bg-white/15 transition-colors px-3 py-1.5 whitespace-nowrap"
-                    >
-                      Cancel
-                    </button>
-                  </>
-                )}
+                <button
+                  onClick={() => setRemoveOpen(true)}
+                  className="text-xs font-medium rounded-lg bg-ndp-error/10 hover:bg-ndp-error/20 text-ndp-error transition-colors px-3 py-1.5 whitespace-nowrap"
+                  title="Remove this series from Sonarr's library"
+                >
+                  Remove
+                </button>
               </div>
             </div>
 
@@ -762,7 +816,7 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
             )}
 
             <div className="flex-1 overflow-y-auto p-6">
-              {activeTab === 'overview' && <OverviewTab series={series} />}
+              {activeTab === 'overview' && <OverviewTab series={series} profileName={profileName} />}
 
               {activeTab === 'seasons' && (
                 drilledSeason !== null ? (
@@ -807,6 +861,8 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
                   loading={queueLoading}
                   removing={removingQueue}
                   onRemove={handleRemoveQueue}
+                  outcome={searchOutcome}
+                  searching={searchPhase === 'searching' || searchPhase === 'polling'}
                 />
               )}
 
@@ -822,6 +878,121 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
           </>
         )}
       </div>
+
+      {removeOpen && series && (
+        <RemoveSeriesDialog
+          title={series.title}
+          year={series.year}
+          episodeCount={series.statistics?.episodeFileCount ?? 0}
+          sizeOnDisk={series.statistics?.sizeOnDisk ?? 0}
+          deleteFiles={removeFiles}
+          setDeleteFiles={setRemoveFiles}
+          addExclusion={removeExclusion}
+          setAddExclusion={setRemoveExclusion}
+          busy={deleteState === 'loading'}
+          onConfirm={handleRemoveSeries}
+          onCancel={() => setRemoveOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** A library entry is cheap to re-add; a season of media files is not. The dialog therefore states
+ *  exactly what will and will not be touched, and keeps file deletion opt-in. */
+function RemoveSeriesDialog({
+  title, year, episodeCount, sizeOnDisk,
+  deleteFiles, setDeleteFiles,
+  addExclusion, setAddExclusion,
+  busy, onConfirm, onCancel,
+}: {
+  title: string;
+  year: number;
+  episodeCount: number;
+  sizeOnDisk: number;
+  deleteFiles: boolean;
+  setDeleteFiles: (v: boolean) => void;
+  addExclusion: boolean;
+  setAddExclusion: (v: boolean) => void;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const hasFiles = episodeCount > 0;
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={onCancel}
+    >
+      <div
+        className="card w-full max-w-md p-5 space-y-4 shadow-2xl shadow-black/60"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div>
+          <h3 className="text-base font-semibold text-ndp-text">Remove from Sonarr</h3>
+          <p className="text-sm text-ndp-text-dim mt-1 break-words">
+            {title}{year ? ` (${year})` : ''}
+          </p>
+        </div>
+
+        <p className="text-xs text-ndp-text-dim leading-relaxed">
+          Sonarr will stop tracking this series. {hasFiles
+            ? 'The episodes on disk are kept unless you ask for them below.'
+            : 'There are no episodes on disk, so nothing will be deleted from your storage.'}
+        </p>
+
+        <div className="space-y-2">
+          {hasFiles && (
+            <label className="flex items-start gap-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={deleteFiles}
+                onChange={(e) => setDeleteFiles(e.target.checked)}
+                className="mt-0.5 accent-red-500"
+              />
+              <span className="text-xs">
+                <span className="text-ndp-error font-medium">Also delete the episodes on disk</span>
+                <span className="block text-ndp-text-dim mt-0.5">
+                  Permanently removes {episodeCount} episode{episodeCount === 1 ? '' : 's'}
+                  {sizeOnDisk > 0 ? ` (${formatSize(sizeOnDisk)})` : ''}. This cannot be undone.
+                </span>
+              </span>
+            </label>
+          )}
+
+          <label className="flex items-start gap-2.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={addExclusion}
+              onChange={(e) => setAddExclusion(e.target.checked)}
+              className="mt-0.5 accent-indigo-500"
+            />
+            <span className="text-xs">
+              <span className="text-ndp-text font-medium">Add an import exclusion</span>
+              <span className="block text-ndp-text-dim mt-0.5">
+                Stops a list from re-adding it on the next sync.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            className="text-xs font-medium rounded-lg bg-white/10 text-ndp-text-dim hover:bg-white/15 transition-colors disabled:opacity-50 px-3 py-2"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            className="text-xs font-medium rounded-lg bg-ndp-error text-white hover:bg-ndp-error/80 transition-colors disabled:opacity-50 px-3 py-2"
+          >
+            {busy ? 'Removing\u2026' : (deleteFiles ? 'Remove and delete episodes' : 'Remove')}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -830,24 +1001,87 @@ export function SeriesModal({ seriesId, onClose }: SeriesModalProps) {
 // Sub-components
 // ──────────────────────────────────────────────────────────────────
 
-function OverviewTab({ series }: { series: SeriesDetail }) {
+const SERIES_STATUS_LABEL: Record<string, string> = {
+  continuing: 'Continuing',
+  ended: 'Ended',
+  upcoming: 'Upcoming',
+  deleted: 'Removed from TVDB',
+};
+
+function formatDate(iso?: string): string | null {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return null;
+  return new Date(t).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function OverviewTab({ series, profileName }: { series: SeriesDetail; profileName: string | null }) {
   const stats = series.statistics;
+  const pct = stats ? Math.round(stats.percentOfEpisodes) : 0;
+  const statusLabel = SERIES_STATUS_LABEL[series.status] ?? series.status;
+  const nextAiring = formatDate(series.nextAiring);
+
   return (
     <div className="space-y-4">
-      <Section title="Library">
+      {/* Completion is the number an admin actually came for — give it room instead of burying
+          it as one cell among six. */}
+      {stats && (
+        <div className="card p-4 space-y-3">
+          <div className="flex items-baseline justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-sm font-medium text-ndp-text">
+                {stats.episodeFileCount} of {stats.episodeCount} episodes
+              </span>
+              <span className="px-2 py-0.5 rounded-full bg-white/5 text-[11px] text-ndp-text-dim">{statusLabel}</span>
+              {series.seriesType !== 'standard' && (
+                <span className="px-2 py-0.5 rounded-full bg-white/5 text-[11px] text-ndp-text-dim capitalize">
+                  {series.seriesType}
+                </span>
+              )}
+            </div>
+            <span className="text-sm font-semibold text-ndp-accent tabular-nums">{pct}%</span>
+          </div>
+          <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
+            <div className="h-full bg-ndp-accent transition-all duration-300" style={{ width: `${pct}%` }} />
+          </div>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-ndp-text-dim">
+            <span>{stats.seasonCount} season{stats.seasonCount === 1 ? '' : 's'}</span>
+            <span>{formatSize(stats.sizeOnDisk)} on disk</span>
+            {stats.totalEpisodeCount > stats.episodeCount && (
+              <span>{stats.totalEpisodeCount} total incl. unmonitored</span>
+            )}
+            {nextAiring && <span>Next episode {nextAiring}</span>}
+          </div>
+        </div>
+      )}
+
+      <Section title="In Sonarr">
         <Grid>
-          <Field label="Path"><span className="break-all">{series.path}</span></Field>
-          <Field label="Type" span><span className="capitalize">{series.seriesType}</span></Field>
-          {stats && (
-            <>
-              <Field label="Seasons">{stats.seasonCount}</Field>
-              <Field label="Episodes">{stats.episodeFileCount} / {stats.episodeCount} (of {stats.totalEpisodeCount} total)</Field>
-              <Field label="Complete">{Math.round(stats.percentOfEpisodes)}%</Field>
-              <Field label="Size on disk">{formatSize(stats.sizeOnDisk)}</Field>
-            </>
-          )}
+          {profileName && <Field label="Quality profile">{profileName}</Field>}
+          <Field label="Monitored">{series.monitored ? 'Yes' : 'No'}</Field>
+          <Field label="Type"><span className="capitalize">{series.seriesType}</span></Field>
+          {series.network && <Field label="Network">{series.network}</Field>}
+          {series.airTime && <Field label="Air time">{series.airTime}</Field>}
+          {series.rootFolderPath
+            ? <Field label="Root folder"><span className="break-all">{series.rootFolderPath}</span></Field>
+            : <Field label="Path" span><span className="break-all">{series.path}</span></Field>}
+          {series.added && <Field label="Added to Sonarr">{formatRelativeDate(series.added)}</Field>}
         </Grid>
       </Section>
+
+      {(series.certification || series.originalLanguage?.name || series.firstAired
+        || typeof series.ratings?.value === 'number') && (
+        <Section title="About">
+          <Grid>
+            {series.firstAired && <Field label="First aired">{formatDate(series.firstAired)}</Field>}
+            {series.certification && <Field label="Certification">{series.certification}</Field>}
+            {series.originalLanguage?.name && <Field label="Original language">{series.originalLanguage.name}</Field>}
+            {typeof series.ratings?.value === 'number' && series.ratings.value > 0 && (
+              <Field label="Rating">{series.ratings.value}</Field>
+            )}
+          </Grid>
+        </Section>
+      )}
     </div>
   );
 }
@@ -1050,14 +1284,47 @@ function HistoryContent({
   );
 }
 
+/** `status` says "downloading" even for a finished download stuck at import. `trackedDownloadState`
+ *  is the one that tells the truth, and `trackedDownloadStatus` says whether it needs attention. */
+const QUEUE_STATE_LABEL: Record<string, string> = {
+  downloading: 'Downloading',
+  importPending: 'Waiting to import',
+  importBlocked: 'Import blocked',
+  importing: 'Importing',
+  imported: 'Imported',
+  failedPending: 'Failed',
+  failed: 'Failed',
+  ignored: 'Ignored',
+};
+
+function queueBadge(item: QueueItem): { label: string; className: string } {
+  const state = item.trackedDownloadState;
+  const label = (state && QUEUE_STATE_LABEL[state]) || state || item.status;
+  const className = {
+    error: 'bg-red-500/15 text-red-300',
+    warning: 'bg-amber-500/15 text-amber-300',
+  }[item.trackedDownloadStatus ?? ''] ?? 'bg-sky-500/15 text-sky-300';
+  return { label, className };
+}
+
 function QueueContent({
-  items, loading, removing, onRemove,
+  items, loading, removing, onRemove, outcome, searching,
 }: {
   items: QueueItem[] | null;
   loading: boolean;
   removing: number | null;
   onRemove: (id: number, blocklistFlag: boolean) => void;
+  outcome: SearchOutcome | null;
+  searching: boolean;
 }) {
+  if (searching) {
+    return (
+      <div className="flex flex-col items-center gap-3 py-12">
+        <div className="w-6 h-6 border-2 border-ndp-accent border-t-transparent rounded-full animate-spin" />
+        <p className="text-sm text-ndp-text-dim">Sonarr is searching your indexers…</p>
+      </div>
+    );
+  }
   if (loading && items === null) {
     return (
       <div className="flex justify-center py-12">
@@ -1066,10 +1333,34 @@ function QueueContent({
     );
   }
   if (!items || items.length === 0) {
+    // An empty queue right after a search is a result, not an absence — say which.
+    if (outcome?.kind === 'nothing') {
+      return (
+        <div className="text-center py-12 px-6 space-y-3">
+          <p className="text-sm font-medium text-ndp-text">Sonarr grabbed nothing</p>
+          <p className="text-xs text-ndp-text-dim max-w-sm mx-auto leading-relaxed">
+            {outcome.reason
+              || 'Every release it found was rejected — usually because the episodes on disk already meet your quality cutoff, or no candidate passed your profile.'}
+          </p>
+        </div>
+      );
+    }
     return <div className="text-center py-12 text-sm text-ndp-text-dim">Nothing in the download queue for this series.</div>;
   }
   return (
     <div className="space-y-3">
+      {outcome?.kind === 'grabbed' && (
+        <div className="rounded-xl border border-ndp-success/20 bg-ndp-success/10 px-4 py-3">
+          <p className="text-xs font-semibold text-ndp-success">
+            Sonarr grabbed {outcome.titles.length === 1 ? '1 episode' : `${outcome.titles.length} episodes`}
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {outcome.titles.map((title) => (
+              <li key={title} className="text-[11px] text-ndp-text-dim break-all leading-snug">{title}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       {items.map((item) => {
         const total = item.size || 0;
         const left = item.sizeleft || 0;
@@ -1098,8 +1389,8 @@ function QueueContent({
                   {item.timeleft && (<><span>·</span><span>ETA {item.timeleft}</span></>)}
                 </div>
               </div>
-              <span className="flex-shrink-0 text-[10px] uppercase tracking-wider font-semibold px-2 py-0.5 rounded-full bg-sky-500/15 text-sky-300">
-                {item.status}
+              <span className={`flex-shrink-0 text-[10px] uppercase tracking-wider font-semibold px-2 py-0.5 rounded-full ${queueBadge(item).className}`}>
+                {queueBadge(item).label}
               </span>
             </div>
 

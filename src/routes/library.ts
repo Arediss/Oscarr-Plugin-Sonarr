@@ -43,16 +43,47 @@ function mapSeries(s: SonarrSeries) {
   };
 }
 
+/** A series is only *missing* episodes that have actually aired. An upcoming show with nothing
+ *  on disk is expected to be empty, and a continuing one is legitimately incomplete between
+ *  seasons — painting either red buries the shows an admin can act on. */
+function counts(s: SonarrSeries) {
+  return { ec: s.statistics?.episodeCount ?? 0, fc: s.statistics?.episodeFileCount ?? 0 };
+}
+
+function isComplete(s: SonarrSeries): boolean {
+  const { ec, fc } = counts(s);
+  return ec > 0 && fc >= ec;
+}
+
+function isUpcoming(s: SonarrSeries): boolean {
+  return s.monitored && s.status === 'upcoming' && counts(s).fc === 0;
+}
+
+function isActionableMissing(s: SonarrSeries): boolean {
+  const { ec, fc } = counts(s);
+  return s.monitored && ec > fc && !isUpcoming(s);
+}
+
+const SORTERS: Record<string, (a: SonarrSeries, b: SonarrSeries) => number> = {
+  title: (a, b) => a.title.localeCompare(b.title),
+  year: (a, b) => (a.year || 0) - (b.year || 0),
+  size: (a, b) => (a.statistics?.sizeOnDisk ?? 0) - (b.statistics?.sizeOnDisk ?? 0),
+  added: (a, b) => new Date(a.added || 0).getTime() - new Date(b.added || 0).getTime(),
+  episodes: (a, b) => (a.statistics?.episodeFileCount ?? 0) - (b.statistics?.episodeFileCount ?? 0),
+};
+
 export function libraryRoutes(app: FastifyInstance) {
   // Paginated, filtered series list (cache-backed).
   app.get('/series', async (request) => {
     const api: SonarrPluginApi = (request as any).sonarrApi;
     const {
       search, status, qualityProfileId, rootFolderPath, seriesType,
+      sort = 'title', dir = 'asc',
       page = '1', pageSize = '50',
     } = request.query as Record<string, string>;
 
-    let series = await getCachedSeries(api);
+    const all = await getCachedSeries(api);
+    let series = all;
 
     if (search) {
       const q = search.toLowerCase();
@@ -61,17 +92,11 @@ export function libraryRoutes(app: FastifyInstance) {
 
     // status filter — applied on derived state (not raw Sonarr status)
     if (status === 'complete') {
-      series = series.filter((s) => {
-        const ec = s.statistics?.episodeCount ?? 0;
-        const fc = s.statistics?.episodeFileCount ?? 0;
-        return ec > 0 && fc >= ec;
-      });
+      series = series.filter(isComplete);
     } else if (status === 'missing') {
-      series = series.filter((s) => {
-        const ec = s.statistics?.episodeCount ?? 0;
-        const fc = s.statistics?.episodeFileCount ?? 0;
-        return s.monitored && ec > fc;
-      });
+      series = series.filter(isActionableMissing);
+    } else if (status === 'upcoming') {
+      series = series.filter(isUpcoming);
     } else if (status === 'unmonitored') {
       series = series.filter((s) => !s.monitored);
     } else if (status === 'continuing') {
@@ -83,6 +108,10 @@ export function libraryRoutes(app: FastifyInstance) {
     if (qualityProfileId) series = series.filter((s) => s.qualityProfileId === parseInt(qualityProfileId));
     if (rootFolderPath) series = series.filter((s) => s.rootFolderPath === rootFolderPath);
     if (seriesType) series = series.filter((s) => s.seriesType === seriesType);
+
+    // Sort before slicing, or page 2 would be drawn from a differently-ordered list.
+    const sorter = SORTERS[sort] ?? SORTERS.title;
+    series = [...series].sort(dir === 'desc' ? (a, b) => sorter(b, a) : sorter);
 
     const total = series.length;
     const p = Math.max(1, parseInt(page));
@@ -96,6 +125,16 @@ export function libraryRoutes(app: FastifyInstance) {
       pageSize: ps,
       hasMore: start + ps < total,
       series: slice.map(mapSeries),
+      // Library-wide totals, deliberately computed before filtering: the header states what the
+      // library holds, not what the current filter happens to show.
+      library: {
+        count: all.length,
+        sizeOnDisk: all.reduce((sum, s) => sum + (s.statistics?.sizeOnDisk ?? 0), 0),
+        complete: all.filter(isComplete).length,
+        missing: all.filter(isActionableMissing).length,
+        upcoming: all.filter(isUpcoming).length,
+        unmonitored: all.filter((s) => !s.monitored).length,
+      },
     };
   });
 
@@ -105,11 +144,18 @@ export function libraryRoutes(app: FastifyInstance) {
   });
 
   // Single series detail (raw Sonarr series + derived stats).
+  // The profile name is resolved here rather than in the modal: it is one call the backend
+  // already has an authenticated client for, and it saves the frontend a second round trip
+  // just to turn an id into a word.
   app.get('/series/:id', async (request) => {
     const api: SonarrPluginApi = (request as any).sonarrApi;
     const { id } = request.params as { id: string };
-    const series = await api.getSeries(parseInt(id));
-    return { series };
+    const [series, profiles] = await Promise.all([
+      api.getSeries(parseInt(id)),
+      api.getQualityProfiles().catch(() => []),
+    ]);
+    const qualityProfileName = profiles.find((p) => p.id === series.qualityProfileId)?.name ?? null;
+    return { series, qualityProfileName };
   });
 
   app.put('/series/:id/monitored', async (request) => {
@@ -151,12 +197,17 @@ export function libraryRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
+  // Both flags default to false: removing a library entry should never take files with it
+  // unless it was asked for.
   app.delete('/series/:id', async (request) => {
     const api: SonarrPluginApi = (request as any).sonarrApi;
     const { id } = request.params as { id: string };
-    const { deleteFiles } = request.query as Record<string, string>;
-    await api.deleteSeries(parseInt(id), deleteFiles === 'true');
-    seriesCache = null;
+    const { deleteFiles, addImportExclusion } = request.query as Record<string, string>;
+    await api.deleteSeries(parseInt(id), {
+      deleteFiles: deleteFiles === 'true',
+      addImportExclusion: addImportExclusion === 'true',
+    });
+    seriesCache = null; // the list would otherwise keep serving the series for up to 60s
     return { ok: true };
   });
 
