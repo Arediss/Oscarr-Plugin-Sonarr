@@ -50,3 +50,32 @@ npm run dev
 ## License
 
 MIT.
+
+## Storage limits
+
+### Dashboard widget
+
+In the admin dashboard, choose **Edit → Add widget → Plugins → Sonarr**.
+The widget shows library counters and the two fullest reported storage paths, with links
+to the library and analytics. It can be moved and resized like the qBittorrent widget.
+Data refreshes every two minutes while the page is visible, or with the refresh button.
+It uses the existing `sonarr.view` permission and does not need additional capabilities.
+
+### Per-path limits
+
+Open **Analytics → Storage limits** to record a limit in GiB for each reported path.
+Use decimal values when needed; leave a field blank (or enter zero) to remove a limit.
+Saved limits for paths temporarily absent from the service remain available in the editor.
+
+Disk bars show **filesystem usage** reported by Sonarr. Linux user/group quota usage is
+not included in that data. Declared limits are reference values only: they neither enforce
+a server quota nor provide its remaining space. The plugin does not subtract total filesystem
+usage from a user's limit, since that usage may include files belonging to other accounts.
+
+## Validation
+
+```bash
+npm ci
+npm test
+npm run build
+```

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useId, useState } from 'react';
 import { LibraryTab } from './components/LibraryTab';
 import { AnalyticsTab } from './components/AnalyticsTab';
 import { QualityTab } from './components/QualityTab';
@@ -7,68 +7,60 @@ import { FilesTab } from './components/FilesTab';
 import { DownloadsTab } from './components/DownloadsTab';
 
 const TABS = [
-  { id: 'library', label: 'Library' },
-  { id: 'downloads', label: 'Downloads' },
-  { id: 'analytics', label: 'Analytics' },
-  { id: 'quality', label: 'Quality' },
-  { id: 'releases', label: 'Releases' },
-  { id: 'files', label: 'Files' },
+  { id: 'library', label: 'Library', Component: LibraryTab },
+  { id: 'downloads', label: 'Downloads', Component: DownloadsTab },
+  { id: 'analytics', label: 'Analytics', Component: AnalyticsTab },
+  { id: 'quality', label: 'Quality', Component: QualityTab },
+  { id: 'releases', label: 'Releases', Component: ReleasesTab },
+  { id: 'files', label: 'Files', Component: FilesTab },
 ] as const;
 
 type TabId = (typeof TABS)[number]['id'];
 
 function getInitialTab(): TabId {
-  const hash = window.location.hash.replace('#', '');
-  if (TABS.some((t) => t.id === hash)) return hash as TabId;
-  return 'library';
+  const hash = window.location.hash.slice(1);
+  return TABS.find(tab => tab.id === hash)?.id ?? 'library';
 }
 
 export default function SonarrManager() {
   const [activeTab, setActiveTab] = useState<TabId>(getInitialTab);
+  const id = useId();
+  useEffect(() => {
+    const sync = () => setActiveTab(getInitialTab());
+    window.addEventListener('hashchange', sync);
+    return () => window.removeEventListener('hashchange', sync);
+  }, []);
 
-  const handleTabChange = (tab: TabId) => {
-    setActiveTab(tab);
-    window.location.hash = tab;
-  };
+  const select = (tab: TabId) => { setActiveTab(tab); window.location.hash = tab; };
+  const ActiveComponent = TABS.find(tab => tab.id === activeTab)!.Component;
 
-  return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center gap-3">
-        <svg className="w-6 h-6 text-ndp-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <rect x="2" y="7" width="20" height="15" rx="2" ry="2" />
-          <polyline points="17 2 12 7 7 2" />
+  return <div className="arr-manager">
+    <header className="arr-manager-header">
+      <span className="arr-manager-logo">
+        <svg width="25" height="25" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <rect x="2" y="7" width="20" height="15" rx="3" /><path d="m7 2 5 5 5-5" />
         </svg>
-        <h1 className="text-2xl font-bold text-ndp-text">Sonarr Manager</h1>
-      </div>
-
-      {/* Tab Navigation */}
-      <div className="flex gap-2 overflow-x-auto pb-1" style={{ scrollbarWidth: 'none' }}>
-        {TABS.map(({ id, label }) => (
-          <button
-            key={id}
-            onClick={() => handleTabChange(id)}
-            className={
-              'px-5 py-2.5 rounded-xl text-sm font-medium transition-all whitespace-nowrap ' +
-              (activeTab === id
-                ? 'bg-ndp-accent text-white'
-                : 'bg-ndp-surface text-ndp-text-muted hover:bg-ndp-surface-light')
-            }
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {/* Tab Content */}
-      <div className="animate-fade-in" key={activeTab}>
-        {activeTab === 'library' && <LibraryTab />}
-        {activeTab === 'downloads' && <DownloadsTab />}
-        {activeTab === 'analytics' && <AnalyticsTab />}
-        {activeTab === 'quality' && <QualityTab />}
-        {activeTab === 'releases' && <ReleasesTab />}
-        {activeTab === 'files' && <FilesTab />}
-      </div>
+      </span>
+      <div><h1>Sonarr Manager</h1><p>Your series library, downloads and storage.</p></div>
+    </header>
+    <div className="arr-tabs" role="tablist" aria-label="Sonarr sections">
+      {TABS.map((tab, index) => <button key={tab.id} type="button" role="tab"
+        id={id + '-' + tab.id} aria-controls={id + '-panel'} aria-selected={activeTab === tab.id}
+        tabIndex={activeTab === tab.id ? 0 : -1} onClick={() => select(tab.id)}
+        onKeyDown={event => {
+          let next: number;
+          if (event.key === 'ArrowRight') next = (index + 1) % TABS.length;
+          else if (event.key === 'ArrowLeft') next = (index - 1 + TABS.length) % TABS.length;
+          else if (event.key === 'Home') next = 0;
+          else if (event.key === 'End') next = TABS.length - 1;
+          else return;
+          event.preventDefault();
+          select(TABS[next].id);
+          document.getElementById(id + '-' + TABS[next].id)?.focus();
+        }}>{tab.label}</button>)}
     </div>
-  );
+    <div id={id + '-panel'} role="tabpanel" aria-labelledby={id + '-' + activeTab} tabIndex={0}>
+      <ActiveComponent key={activeTab} />
+    </div>
+  </div>;
 }

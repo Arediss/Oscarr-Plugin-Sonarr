@@ -1,17 +1,7 @@
 /**
- * Admin-declared storage caps, per root folder.
- *
- * Radarr and Sonarr report what `statfs` says about the filesystem, which is the truth unless a
- * quota sits between the account and the disk. Project quotas (XFS) and dataset quotas (ZFS) are
- * already reflected there; *user* and *group* quotas are not — `df` shows the whole filesystem and
- * the operator hits a wall long before it fills.
- *
- * Reading the real quota would mean running `quota` as the owning user on the host that holds the
- * media. Oscarr runs in its own container, without the library mounted and without those tools, so
- * anything it measured would describe its own volume. Rather than print a confident wrong number,
- * the admin declares the cap and we do the arithmetic.
+ * Manual storage limits are reference values. The arr disk-space endpoint reports
+ * filesystem usage, not usage charged to a Linux user/group quota.
  */
-
 export interface DiskEntry {
   path: string;
   label: string;
@@ -22,16 +12,13 @@ export interface DiskEntry {
 export interface DiskView extends DiskEntry {
   usedSpace: number;
   usedPercent: number;
-  /** Declared cap in bytes, or null when the admin has not set one for this path. */
   quotaBytes: number | null;
-  /** What is actually writable: the filesystem's free space, or what the cap leaves. */
-  effectiveFree: number;
-  /** True when the cap, not the disk, is the binding constraint. */
-  quotaLimited: boolean;
+  /** Unknown for a declared quota: its usage is not available from the arr API. */
+  effectiveFree: number | null;
+  quotaLimited: boolean | null;
 }
 
-/** Trailing slashes differ between what an *arr reports and what an admin types. */
-function normalise(path: string): string {
+export function normalise(path: string): string {
   return path.replace(/\/+$/, '') || '/';
 }
 
@@ -40,49 +27,40 @@ export function parseQuotas(raw: string | null | undefined): Record<string, numb
   try {
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out: Record<string, number> = {};
-    for (const [path, value] of Object.entries(parsed as Record<string, unknown>)) {
+    return Object.fromEntries(Object.entries(parsed).flatMap(([path, value]) => {
       const bytes = Number(value);
-      // 0 and negatives mean "no cap" — treat them as absent rather than as a full disk.
-      if (Number.isFinite(bytes) && bytes > 0) out[normalise(path)] = Math.floor(bytes);
-    }
-    return out;
+      return Number.isSafeInteger(bytes) && bytes > 0 ? [[normalise(path), bytes]] : [];
+    }));
   } catch {
     return {};
   }
 }
 
-export function serialiseQuotas(quotas: Record<string, number>): string {
-  const clean: Record<string, number> = {};
-  for (const [path, bytes] of Object.entries(quotas)) {
-    const n = Number(bytes);
-    if (Number.isFinite(n) && n > 0) clean[normalise(path)] = Math.floor(n);
-  }
-  return JSON.stringify(clean);
+/** Reject invalid writes as a whole instead of silently removing existing limits. */
+export function serialiseQuotas(quotas: Record<string, unknown>): string {
+  const entries = Object.entries(quotas).map(([path, bytes]) => {
+    if (!path.trim() || typeof bytes !== 'number' || !Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new Error('Each storage limit must be a non-negative whole number of bytes keyed by a path.');
+    }
+    return [normalise(path), bytes] as const;
+  });
+  return JSON.stringify(Object.fromEntries(entries.filter(([, bytes]) => bytes > 0)));
 }
 
-/**
- * A cap smaller than what is already used leaves nothing writable, not a negative number — that
- * is the state an operator is actually in when they blow past a quota.
- */
 export function applyQuotas(disks: DiskEntry[], quotas: Record<string, number>): DiskView[] {
-  // Normalised on both sides rather than trusting the caller to have gone through parseQuotas —
-  // a raw map used to silently match nothing, which reads as "no quota" instead of as a mistake.
-  const byPath = new Map<string, number>();
-  for (const [path, bytes] of Object.entries(quotas)) byPath.set(normalise(path), bytes);
-
-  return disks.map((d) => {
-    const usedSpace = d.totalSpace - d.freeSpace;
-    const quotaBytes = byPath.get(normalise(d.path)) ?? null;
-    const quotaFree = quotaBytes === null ? null : Math.max(0, quotaBytes - usedSpace);
-    const effectiveFree = quotaFree === null ? d.freeSpace : Math.min(d.freeSpace, quotaFree);
+  const byPath = new Map(Object.entries(quotas).map(([path, bytes]) => [normalise(path), bytes]));
+  return disks.map((disk) => {
+    const totalSpace = Number.isFinite(disk.totalSpace) ? Math.max(0, disk.totalSpace) : 0;
+    const freeSpace = Number.isFinite(disk.freeSpace) ? Math.max(0, Math.min(disk.freeSpace, totalSpace)) : 0;
+    const usedSpace = totalSpace - freeSpace;
+    const quotaBytes = byPath.get(normalise(disk.path)) ?? null;
     return {
-      ...d,
-      usedSpace,
-      usedPercent: d.totalSpace > 0 ? Math.round((usedSpace / d.totalSpace) * 100) : 0,
+      ...disk, totalSpace, freeSpace, usedSpace,
+      usedPercent: totalSpace > 0 ? Math.round(usedSpace / totalSpace * 100) : 0,
       quotaBytes,
-      effectiveFree,
-      quotaLimited: quotaFree !== null && quotaFree < d.freeSpace,
+      // Never subtract filesystem usage (which includes other users) from a user quota.
+      effectiveFree: quotaBytes === null ? freeSpace : null,
+      quotaLimited: quotaBytes === null ? false : null,
     };
   });
 }

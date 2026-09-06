@@ -133,7 +133,12 @@ export function analyticsRoutes(app: FastifyInstance, ctx: QuotaContext) {
     if (!body.quotas || typeof body.quotas !== 'object' || Array.isArray(body.quotas)) {
       return reply.status(400).send({ error: 'quotas must be an object keyed by root folder path' });
     }
-    const stored = serialiseQuotas(body.quotas as Record<string, number>);
+    let stored: string;
+    try {
+      stored = serialiseQuotas(body.quotas as Record<string, unknown>);
+    } catch (error) {
+      return reply.status(400).send({ error: (error as Error).message });
+    }
     await ctx.setSetting('rootFolderQuotas', stored);
     return { quotas: parseQuotas(stored) };
   });

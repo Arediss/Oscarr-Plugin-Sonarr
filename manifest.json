@@ -16,7 +16,7 @@
   ],
   "capabilityReasons": {
     "permissions": "Declares sonarr.view / sonarr.manage so the Sonarr tab can be delegated to a non-admin role.",
-    "settings:plugin": "Stores the storage caps the admin declares per root folder, so reported free space reflects a user quota that the filesystem does not expose."
+    "settings:plugin": "Stores manually declared storage limits as reference values per path. Linux user quota usage is not available from the service's disk-space API."
   },
   "hooks": {
     "routes": {
@@ -30,6 +30,22 @@
           "icon": "Tv"
         },
         "order": 50
+      },
+      {
+        "hookPoint": "admin.dashboard.widget",
+        "props": {
+          "id": "sonarr-overview",
+          "title": "Sonarr",
+          "icon": "Tv",
+          "defaultSize": {
+            "w": 4,
+            "h": 7
+          },
+          "minSize": {
+            "w": 3,
+            "h": 4
+          }
+        }
       }
     ]
   },
